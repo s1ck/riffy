@@ -1,3 +1,10 @@
+//! # Riffy
+//!
+//! Riffy is an unbounded, wait-free, multi-producer-single-consumer queue.
+//!
+//! It's a Rust-port of [Jiffy](https://github.com/DolevAdas/Jiffy)
+//! which is implemented in C++ and described in [this arxiv paper](https://arxiv.org/abs/2010.14189).
+
 use core::ptr;
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -121,10 +128,24 @@ impl<T> BufferList<T> {
     }
 }
 
-/// A Multi-Producer, Single-Consumer Queue implementation as described in
-/// https://arxiv.org/pdf/2010.14189.pdf.
+/// A multi-producer-single-consumer queue.
 ///
-/// The queue is unbounded and wait-free.
+/// # Examples
+///
+/// ```
+/// use riffy::MpscQueue;
+///
+/// let mut q = MpscQueue::new();
+///
+/// assert_eq!(q.dequeue(), None);
+///
+/// q.enqueue(42);
+/// q.enqueue(84);
+///
+/// assert_eq!(q.dequeue(), Some(42));
+/// assert_eq!(q.dequeue(), Some(84));
+/// assert_eq!(q.dequeue(), None);
+/// ```
 pub struct MpscQueue<T> {
     head_of_queue: *mut BufferList<T>,
     tail_of_queue: AtomicPtr<BufferList<T>>,
