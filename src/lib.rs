@@ -499,11 +499,11 @@ impl<T> MpscQueue<T> {
         Ok(())
     }
 
-    fn allocate_buffer(&mut self, temp_tail: &mut BufferList<T>) -> *mut BufferList<T> {
+    fn allocate_buffer(&mut self, buffer: &mut BufferList<T>) -> *mut BufferList<T> {
         let new_buffer = BufferList::with_prev(
             self.buffer_size,
-            temp_tail.pos + 1,
-            temp_tail as *mut _,
+            buffer.pos + 1,
+            buffer as *mut _,
         );
 
         Box::into_raw(Box::new(new_buffer))
@@ -603,5 +603,20 @@ mod tests {
         assert_eq!(Ok(()), q.enqueue(42));
         assert_eq!(Some(42), q.dequeue());
         assert_eq!(None, q.dequeue());
+    }
+
+    #[test]
+    fn dequeue_exceeds_buffer() {
+        let mut q = MpscQueue::new();
+
+        let size = BUFFER_SIZE * 2.5 as usize;
+
+        for i in 0..size {
+            assert_eq!(q.enqueue(i), Ok(()));
+        }
+
+        for i in 0..size {
+            assert_eq!(q.dequeue(), Some(i));
+        }
     }
 }
