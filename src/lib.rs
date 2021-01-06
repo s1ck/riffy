@@ -544,6 +544,12 @@ impl<T> MpscQueue<T> {
     }
 }
 
+impl<T> Default for MpscQueue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
