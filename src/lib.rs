@@ -373,7 +373,7 @@ impl<T> MpscQueue<T> {
                         return None;
                     }
                 } else {
-                    let next = self.deref_buffer(temp_buffer).next.load(Acquire);
+                    let next = unsafe { &*temp_buffer }.next.load(Acquire);
                     if next.is_null() {
                         // We reached the last buffer in the queue.
                         return None;
@@ -433,7 +433,7 @@ impl<T> MpscQueue<T> {
         buffer_ptr: &mut *mut BufferList<T>,
         buffer_head: &mut usize,
     ) -> bool {
-        let buffer = self.deref_buffer(*buffer_ptr);
+        let buffer = unsafe { &**buffer_ptr };
 
         let next = buffer.next.load(Acquire);
         let prev = buffer.prev;
@@ -443,8 +443,8 @@ impl<T> MpscQueue<T> {
             return false;
         }
 
-        self.deref_buffer_mut(next).prev = prev;
-        self.deref_buffer_mut(prev)
+        unsafe { &mut *next }.prev = prev;
+        unsafe { &mut *prev }
             .next
             .store(next, Ordering::Release);
 
@@ -453,7 +453,7 @@ impl<T> MpscQueue<T> {
 
         // Advance to the next buffer.
         *buffer_ptr = next;
-        *buffer_head = self.deref_buffer_mut(*buffer_ptr).head;
+        *buffer_head = unsafe { &mut **buffer_ptr }.head;
 
         true
     }
@@ -507,14 +507,6 @@ impl<T> MpscQueue<T> {
         );
 
         Box::into_raw(Box::new(new_buffer))
-    }
-
-    fn deref_buffer(&self, ptr: *mut BufferList<T>) -> &BufferList<T> {
-        unsafe { &*ptr }
-    }
-
-    fn deref_buffer_mut(&mut self, ptr: *mut BufferList<T>) -> &mut BufferList<T> {
-        unsafe { &mut *ptr }
     }
 
     fn drop_buffer(ptr: *mut BufferList<T>) {
