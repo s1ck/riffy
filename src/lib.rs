@@ -155,7 +155,6 @@ pub struct MpscQueue<T> {
 }
 
 impl<T> MpscQueue<T> {
-
     pub fn new() -> Self {
         let head_of_queue = BufferList::new(BUFFER_SIZE, 1);
         // move to heap
@@ -300,7 +299,7 @@ impl<T> MpscQueue<T> {
                 }
 
                 let next = unsafe { &*self.head_of_queue }.next.load(Acquire);
-                if next == ptr::null_mut() {
+                if next.is_null() {
                     return None;
                 }
 
@@ -335,12 +334,7 @@ impl<T> MpscQueue<T> {
                     // dequeue candidate and we restart the scan process from the head.
                     // This process continues until there is no change found during scan.
                     // After scanning, `temp_node` stores the candidate node to dequeue.
-                    self.scan(
-                        node,
-                        &mut temp_buffer,
-                        &mut temp_head,
-                        &mut temp_node,
-                    );
+                    self.scan(node, &mut temp_buffer, &mut temp_head, &mut temp_node);
 
                     // Check if the actual head has been set in between.
                     if node.state() == Set {
@@ -350,15 +344,13 @@ impl<T> MpscQueue<T> {
                     // Dequeue the found candidate.
                     let data = MpscQueue::read_data(&mut temp_node);
 
-                    if search_next_buffer
-                        && (temp_head - 1) == unsafe { (*temp_buffer).head }
-                    {
+                    if search_next_buffer && (temp_head - 1) == unsafe { (*temp_buffer).head } {
                         // If we moved to a new buffer, we need to move the head forward so
                         // in the end we can delete the buffer.
                         unsafe { (*temp_buffer).head += 1 };
                     }
 
-                    Some(data);
+                    return Some(data);
                 }
 
                 if temp_node.state() == Empty {
@@ -382,7 +374,7 @@ impl<T> MpscQueue<T> {
                     }
                 } else {
                     let next = self.deref_buffer(temp_buffer).next.load(Acquire);
-                    if next == ptr::null_mut() {
+                    if next.is_null() {
                         // We reached the last buffer in the queue.
                         return None;
                     }
@@ -446,7 +438,7 @@ impl<T> MpscQueue<T> {
         let next = buffer.next.load(Acquire);
         let prev = buffer.prev;
 
-        if next == ptr::null_mut() {
+        if next.is_null() {
             // We reached the last buffer, which cannot be dropped.
             return false;
         }
@@ -514,16 +506,14 @@ impl<T> MpscQueue<T> {
             temp_tail as *mut _,
         );
 
-        let new_buffer = Box::new(new_buffer);
-        let new_buffer_ptr = Box::into_raw(new_buffer);
-        new_buffer_ptr
+        Box::into_raw(Box::new(new_buffer))
     }
 
     fn deref_buffer(&self, ptr: *mut BufferList<T>) -> &BufferList<T> {
         unsafe { &*ptr }
     }
 
-    fn deref_buffer_mut(&self, ptr: *mut BufferList<T>) -> &mut BufferList<T> {
+    fn deref_buffer_mut(&mut self, ptr: *mut BufferList<T>) -> &mut BufferList<T> {
         unsafe { &mut *ptr }
     }
 
