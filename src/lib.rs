@@ -7,7 +7,7 @@
 
 use core::ptr;
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 
 use crate::State::{Empty, Handled, Set};
@@ -65,7 +65,7 @@ impl<T> Node<T> {
     /// Load the given data into the node and change its state to `Set`.
     unsafe fn set_data(&mut self, data: T) {
         self.data.as_mut_ptr().write(data);
-        self.is_set.store(State::Set.into(), Relaxed);
+        self.is_set.store(State::Set.into(), Release);
     }
 
     fn state(&self) -> State {
