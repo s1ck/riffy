@@ -3,6 +3,9 @@ name = "riffy"
 version = "0.1.0"
 authors = ["Martin Junghanns <nerfaktor42@mailbox.org>", "Paul Horn <developer@knutwalker.de>"]
 edition = "2018"
+description = "An unbounded, wait-free, multi-producer-single-consumer queue."
+license = "MIT"
+repository = "https://github.com/s1ck/riffy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
