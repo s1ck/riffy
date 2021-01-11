@@ -4,9 +4,16 @@ version = "0.1.0"
 authors = ["Martin Junghanns <nerfaktor42@mailbox.org>", "Paul Horn <developer@knutwalker.de>"]
 edition = "2018"
 description = "An unbounded, wait-free, multi-producer-single-consumer queue."
+keywords = ["mpsc", "fifo", "thread"]
 license = "MIT"
 repository = "https://github.com/s1ck/riffy"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
+[dev-dependencies]
+criterion = "0.3.3"
+rand = "0.8.1"
+
+[[bench]]
+name = "basic"
+harness = false
