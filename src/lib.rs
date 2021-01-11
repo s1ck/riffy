@@ -6,9 +6,12 @@
 //! which is implemented in C++ and described in [this arxiv paper](https://arxiv.org/abs/2010.14189).
 
 use core::ptr;
+use std::cell::Cell;
+use std::error::Error;
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::State::{Empty, Handled, Set};
 
@@ -151,7 +154,7 @@ unsafe impl<T> Sync for BufferList<T> {}
 /// ```
 #[derive(Debug)]
 pub struct MpscQueue<T> {
-    head_of_queue: *mut BufferList<T>,
+    head_of_queue: Cell<*mut BufferList<T>>,
     tail_of_queue: AtomicPtr<BufferList<T>>,
 
     buffer_size: usize,
@@ -172,7 +175,7 @@ impl<T> MpscQueue<T> {
         let tail = AtomicPtr::new(head);
 
         MpscQueue {
-            head_of_queue: head,
+            head_of_queue: Cell::new(head),
             tail_of_queue: tail,
             buffer_size: BUFFER_SIZE,
             tail: AtomicUsize::new(0),
@@ -250,7 +253,7 @@ impl<T> MpscQueue<T> {
         }
     }
 
-    pub fn dequeue(&mut self) -> Option<T> {
+    pub fn dequeue(&self) -> Option<T> {
         // The buffer from which we eventually dequeue from.
         let mut temp_tail;
 
@@ -259,8 +262,8 @@ impl<T> MpscQueue<T> {
             // The number of items in the queue without the current buffer.
             let prev_size = self.size_without_buffer(temp_tail);
 
-            let head = &mut unsafe { &mut *self.head_of_queue }.head;
-            let head_is_tail = self.head_of_queue == temp_tail;
+            let head = &mut unsafe { &mut *self.head_of_queue.get() }.head;
+            let head_is_tail = self.head_of_queue.get() == temp_tail;
             let head_is_empty = *head == self.tail.load(Ordering::Acquire) - prev_size;
 
             // The queue is empty.
@@ -270,7 +273,7 @@ impl<T> MpscQueue<T> {
 
             // There are un-handled elements in the current buffer.
             if *head < self.buffer_size {
-                let node = &mut unsafe { &mut *self.head_of_queue }.nodes[*head];
+                let node = &mut unsafe { &mut *self.head_of_queue.get() }.nodes[*head];
 
                 // Check if the node has already been dequeued.
                 // If yes, we increment head and move on.
@@ -291,7 +294,7 @@ impl<T> MpscQueue<T> {
                 // The current head points to a valid node and can be dequeued.
                 if node.state() == Set {
                     // Increment head
-                    unsafe { (*self.head_of_queue).head += 1 };
+                    unsafe { (*self.head_of_queue.get()).head += 1 };
                     let data = MpscQueue::read_data(node);
                     return Some(data);
                 }
@@ -300,26 +303,26 @@ impl<T> MpscQueue<T> {
             // The head buffer has been handled and can be removed.
             // The new head becomes the successor of the current head buffer.
             if *head >= self.buffer_size {
-                if self.head_of_queue == self.tail_of_queue.load(Acquire) {
+                if self.head_of_queue.get() == self.tail_of_queue.load(Acquire) {
                     // There is only one buffer.
                     return None;
                 }
 
-                let next = unsafe { &*self.head_of_queue }.next.load(Acquire);
+                let next = unsafe { &*self.head_of_queue.get() }.next.load(Acquire);
                 if next.is_null() {
                     return None;
                 }
 
                 // Drop head buffer.
-                MpscQueue::drop_buffer(self.head_of_queue);
+                MpscQueue::drop_buffer(self.head_of_queue.get());
 
-                self.head_of_queue = next;
+                self.head_of_queue.set(next);
             }
         }
     }
 
-    fn search(&mut self, head: &mut usize, node: &mut Node<T>) -> Option<T> {
-        let mut temp_buffer = self.head_of_queue;
+    fn search(&self, head: &mut usize, node: &mut Node<T>) -> Option<T> {
+        let mut temp_buffer = self.head_of_queue.get();
         let mut temp_head = *head;
         // Indicates if we need to continue the search in the next buffer.
         let mut search_next_buffer = false;
@@ -330,7 +333,7 @@ impl<T> MpscQueue<T> {
             // There are unhandled elements in the current buffer.
             if temp_head < self.buffer_size {
                 // Move forward inside the current buffer.
-                let mut temp_node = &mut unsafe { &mut *self.head_of_queue }.nodes[temp_head];
+                let mut temp_node = &mut unsafe { &mut *self.head_of_queue.get() }.nodes[temp_head];
                 temp_head += 1;
 
                 // We found a set node which becomes the new candidate for dequeue.
@@ -397,14 +400,14 @@ impl<T> MpscQueue<T> {
     }
 
     fn scan(
-        &mut self,
+        &self,
         // The element at the head of the queue (which is not set yet).
         node: &Node<T>,
         temp_head_of_queue: &mut *mut BufferList<T>,
         temp_head: &mut usize,
         temp_node: &mut &mut Node<T>,
     ) {
-        let mut scan_head_of_queue = self.head_of_queue;
+        let mut scan_head_of_queue = self.head_of_queue.get();
         let mut scan_head = unsafe { &*scan_head_of_queue }.head;
 
         while node.state() == Empty && scan_head_of_queue != *temp_head_of_queue
@@ -429,17 +432,13 @@ impl<T> MpscQueue<T> {
                 *temp_node = scan_node;
 
                 // re-scan from the beginning of the queue
-                scan_head_of_queue = self.head_of_queue;
+                scan_head_of_queue = self.head_of_queue.get();
                 scan_head = unsafe { &*scan_head_of_queue }.head;
             }
         }
     }
 
-    fn fold_buffer(
-        &mut self,
-        buffer_ptr: &mut *mut BufferList<T>,
-        buffer_head: &mut usize,
-    ) -> bool {
+    fn fold_buffer(&self, buffer_ptr: &mut *mut BufferList<T>, buffer_head: &mut usize) -> bool {
         let buffer = unsafe { &**buffer_ptr };
 
         let next = buffer.next.load(Acquire);
@@ -533,6 +532,48 @@ impl<T> Default for MpscQueue<T> {
     }
 }
 
+pub struct Sender<T> {
+    queue: Arc<MpscQueue<T>>,
+}
+
+impl<T> Sender<T> {
+    fn new(queue: Arc<MpscQueue<T>>) -> Self {
+        Sender { queue }
+    }
+
+    pub fn send(&self, t: T) -> Result<(), T> {
+        self.queue.enqueue(t)
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Sender {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
+pub struct Receiver<T> {
+    queue: Arc<MpscQueue<T>>,
+}
+
+impl<T> Receiver<T> {
+    fn new(queue: Arc<MpscQueue<T>>) -> Self {
+        Receiver { queue }
+    }
+
+    pub fn recv(&self) -> Result<Option<T>, Box<dyn Error>> {
+        let head = self.queue.dequeue();
+        Ok(head)
+    }
+}
+
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    let queue = Arc::new(MpscQueue::new());
+    (Sender::new(queue.clone()), Receiver::new(queue))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -546,26 +587,26 @@ mod tests {
         let q = MpscQueue::new();
 
         unsafe {
-            assert_eq!(State::Empty, (*q.head_of_queue).nodes[0].state());
+            assert_eq!(State::Empty, (*q.head_of_queue.get()).nodes[0].state());
         }
         unsafe {
-            assert_eq!(State::Empty, (*q.head_of_queue).nodes[1].state());
+            assert_eq!(State::Empty, (*q.head_of_queue.get()).nodes[1].state());
         }
 
         assert_eq!(Ok(()), q.enqueue(42));
         assert_eq!(Ok(()), q.enqueue(43));
 
         unsafe {
-            assert_eq!(42, (*q.head_of_queue).nodes[0].data.assume_init());
+            assert_eq!(42, (*q.head_of_queue.get()).nodes[0].data.assume_init());
         }
         unsafe {
-            assert_eq!(State::Set, (*q.head_of_queue).nodes[0].state());
+            assert_eq!(State::Set, (*q.head_of_queue.get()).nodes[0].state());
         }
         unsafe {
-            assert_eq!(43, (*q.head_of_queue).nodes[1].data.assume_init());
+            assert_eq!(43, (*q.head_of_queue.get()).nodes[1].data.assume_init());
         }
         unsafe {
-            assert_eq!(State::Set, (*q.head_of_queue).nodes[1].state());
+            assert_eq!(State::Set, (*q.head_of_queue.get()).nodes[1].state());
         }
     }
 
@@ -583,7 +624,7 @@ mod tests {
 
             if buffer == 0 {
                 unsafe {
-                    assert_eq!(i, (*q.head_of_queue).nodes[index].data.assume_init());
+                    assert_eq!(i, (*q.head_of_queue.get()).nodes[index].data.assume_init());
                 }
             } else {
                 unsafe {
@@ -600,7 +641,7 @@ mod tests {
 
     #[test]
     fn dequeue() {
-        let mut q = MpscQueue::new();
+        let q = MpscQueue::new();
 
         assert_eq!(None, q.dequeue());
         assert_eq!(Ok(()), q.enqueue(42));
@@ -610,7 +651,7 @@ mod tests {
 
     #[test]
     fn dequeue_exceeds_buffer() {
-        let mut q = MpscQueue::new();
+        let q = MpscQueue::new();
 
         let size = BUFFER_SIZE * 2.5 as usize;
 
@@ -624,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_multi_threaded() {
+    fn multi_threaded_direct() {
         // inspired by sync/mpsc/mpsc_queue/tests.rs:14
         let nthreads = 8;
         let nmsgs = 1000;
@@ -647,11 +688,44 @@ mod tests {
             let _ = handle.join();
         }
 
-        let mut q = Arc::try_unwrap(q).unwrap();
+        let q = Arc::try_unwrap(q).unwrap();
 
         let mut i = 0;
 
         while let Some(data) = q.dequeue() {
+            i += data;
+        }
+
+        let expected = (0..1000).sum::<i32>() * nthreads;
+
+        assert_eq!(i, expected)
+    }
+
+    #[test]
+    fn multi_threaded_channel() {
+        let nthreads = 8;
+        let nmsgs = 1000;
+
+        let (tx, rx) = channel::<i32>();
+
+        let handles = (0..nthreads)
+            .map(|_| {
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    for i in 0..nmsgs {
+                        let _ = tx.send(i).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        let mut i = 0;
+
+        while let Some(data) = rx.recv().unwrap() {
             i += data;
         }
 
