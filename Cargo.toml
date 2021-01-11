@@ -1,6 +1,6 @@
 [package]
 name = "riffy"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Martin Junghanns <nerfaktor42@mailbox.org>", "Paul Horn <developer@knutwalker.de>"]
 edition = "2018"
 description = "An unbounded, wait-free, multi-producer-single-consumer queue."
