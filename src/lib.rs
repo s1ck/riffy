@@ -128,6 +128,9 @@ impl<T> BufferList<T> {
     }
 }
 
+unsafe impl<T> Send for BufferList<T> {}
+unsafe impl<T> Sync for BufferList<T> {}
+
 /// A multi-producer-single-consumer queue.
 ///
 /// # Examples
@@ -146,6 +149,7 @@ impl<T> BufferList<T> {
 /// assert_eq!(q.dequeue(), Some(84));
 /// assert_eq!(q.dequeue(), None);
 /// ```
+#[derive(Debug)]
 pub struct MpscQueue<T> {
     head_of_queue: *mut BufferList<T>,
     tail_of_queue: AtomicPtr<BufferList<T>>,
@@ -153,6 +157,9 @@ pub struct MpscQueue<T> {
     buffer_size: usize,
     tail: AtomicUsize,
 }
+
+unsafe impl<T> Send for MpscQueue<T> {}
+unsafe impl<T> Sync for MpscQueue<T> {}
 
 impl<T> MpscQueue<T> {
     pub fn new() -> Self {
@@ -172,7 +179,7 @@ impl<T> MpscQueue<T> {
         }
     }
 
-    pub fn enqueue(&mut self, data: T) -> Result<(), T> {
+    pub fn enqueue(&self, data: T) -> Result<(), T> {
         // Retrieve an index where we insert the new element.
         // Since this is called by multiple enqueue threads,
         // the generated index can be either past or before
@@ -444,9 +451,7 @@ impl<T> MpscQueue<T> {
         }
 
         unsafe { &mut *next }.prev = prev;
-        unsafe { &mut *prev }
-            .next
-            .store(next, Ordering::Release);
+        unsafe { &mut *prev }.next.store(next, Ordering::Release);
 
         // Drop current buffer
         MpscQueue::drop_buffer(*buffer_ptr);
@@ -458,12 +463,12 @@ impl<T> MpscQueue<T> {
         true
     }
 
-    fn size_without_buffer(&mut self, buffer: &BufferList<T>) -> usize {
+    fn size_without_buffer(&self, buffer: &BufferList<T>) -> usize {
         self.buffer_size * (buffer.pos - 1)
     }
 
     fn insert(
-        &mut self,
+        &self,
         data: T,
         index: usize,
         buffer: &mut BufferList<T>,
@@ -499,12 +504,8 @@ impl<T> MpscQueue<T> {
         Ok(())
     }
 
-    fn allocate_buffer(&mut self, buffer: &mut BufferList<T>) -> *mut BufferList<T> {
-        let new_buffer = BufferList::with_prev(
-            self.buffer_size,
-            buffer.pos + 1,
-            buffer as *mut _,
-        );
+    fn allocate_buffer(&self, buffer: &mut BufferList<T>) -> *mut BufferList<T> {
+        let new_buffer = BufferList::with_prev(self.buffer_size, buffer.pos + 1, buffer as *mut _);
 
         Box::into_raw(Box::new(new_buffer))
     }
@@ -535,12 +536,14 @@ impl<T> Default for MpscQueue<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::thread;
 
     use super::*;
 
     #[test]
     fn enqueue() {
-        let mut q = MpscQueue::new();
+        let q = MpscQueue::new();
 
         unsafe {
             assert_eq!(State::Empty, (*q.head_of_queue).nodes[0].state());
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn enqueue_exceeds_buffer() {
-        let mut q = MpscQueue::new();
+        let q = MpscQueue::new();
 
         for i in 0..BUFFER_SIZE * 2 {
             let _ = q.enqueue(i);
@@ -618,5 +621,42 @@ mod tests {
         for i in 0..size {
             assert_eq!(q.dequeue(), Some(i));
         }
+    }
+
+    #[test]
+    fn enqueue_multi_threaded() {
+        // inspired by sync/mpsc/mpsc_queue/tests.rs:14
+        let nthreads = 8;
+        let nmsgs = 1000;
+        let q = MpscQueue::new();
+
+        let q = Arc::new(q);
+
+        let handles = (0..nthreads)
+            .map(|_| {
+                let q = q.clone();
+                thread::spawn(move || {
+                    for i in 0..nmsgs {
+                        let _ = q.enqueue(i);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        let mut q = Arc::try_unwrap(q).unwrap();
+
+        let mut i = 0;
+
+        while let Some(data) = q.dequeue() {
+            i += data;
+        }
+
+        let expected = (0..1000).sum::<i32>() * nthreads;
+
+        assert_eq!(i, expected)
     }
 }
