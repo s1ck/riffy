@@ -6,12 +6,12 @@
 //! which is implemented in C++ and described in [this arxiv paper](https://arxiv.org/abs/2010.14189).
 
 use core::ptr;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::error::Error;
 use std::mem::MaybeUninit;
-use std::sync::atomic::Ordering::{Acquire, Release};
-use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::Ordering::{Acquire, Release, SeqCst};
 
 use crate::State::{Empty, Handled, Set};
 
@@ -154,7 +154,7 @@ unsafe impl<T> Sync for BufferList<T> {}
 /// ```
 #[derive(Debug)]
 pub struct MpscQueue<T> {
-    head_of_queue: Cell<*mut BufferList<T>>,
+    head_of_queue: UnsafeCell<*mut BufferList<T>>,
     tail_of_queue: AtomicPtr<BufferList<T>>,
 
     buffer_size: usize,
@@ -171,12 +171,13 @@ impl<T> MpscQueue<T> {
         let head = Box::new(head_of_queue);
         // forget about it but keep pointer
         let head = Box::into_raw(head);
-        // make pointer atomic
-        let tail = AtomicPtr::new(head);
+        let head_of_queue = UnsafeCell::new(head);
+
+        let tail_of_queue = AtomicPtr::new(head);
 
         MpscQueue {
-            head_of_queue: Cell::new(head),
-            tail_of_queue: tail,
+            head_of_queue,
+            tail_of_queue,
             buffer_size: BUFFER_SIZE,
             tail: AtomicUsize::new(0),
         }
@@ -262,8 +263,16 @@ impl<T> MpscQueue<T> {
             // The number of items in the queue without the current buffer.
             let prev_size = self.size_without_buffer(temp_tail);
 
-            let head = &mut unsafe { &mut *self.head_of_queue.get() }.head;
-            let head_is_tail = self.head_of_queue.get() == temp_tail;
+            let head_is_tail = unsafe { *self.head_of_queue.get() } == temp_tail as _;
+
+            let head_of_queue = if head_is_tail {
+                temp_tail
+            }   else {
+                unsafe { &mut **self.head_of_queue.get() }
+            };
+
+            let head= &mut head_of_queue.head;
+
             let head_is_empty = *head == self.tail.load(Ordering::Acquire) - prev_size;
 
             // The queue is empty.
@@ -273,7 +282,7 @@ impl<T> MpscQueue<T> {
 
             // There are un-handled elements in the current buffer.
             if *head < self.buffer_size {
-                let node = &mut unsafe { &mut *self.head_of_queue.get() }.nodes[*head];
+                let node = &mut head_of_queue.nodes[*head];
 
                 // Check if the node has already been dequeued.
                 // If yes, we increment head and move on.
@@ -286,7 +295,7 @@ impl<T> MpscQueue<T> {
                 // This means an enqueue thread is still ongoing and we need to find
                 // the next set element (and potentially dequeue that one).
                 if node.state() == Empty {
-                    if let Some(data) = self.search(head, node) {
+                    if let Some(data) = self.search(&head_of_queue, node) {
                         return Some(data);
                     }
                 }
@@ -294,7 +303,7 @@ impl<T> MpscQueue<T> {
                 // The current head points to a valid node and can be dequeued.
                 if node.state() == Set {
                     // Increment head
-                    unsafe { (*self.head_of_queue.get()).head += 1 };
+                    *head += 1;
                     let data = MpscQueue::read_data(node);
                     return Some(data);
                 }
@@ -303,20 +312,22 @@ impl<T> MpscQueue<T> {
             // The head buffer has been handled and can be removed.
             // The new head becomes the successor of the current head buffer.
             if *head >= self.buffer_size {
-                if self.head_of_queue.get() == self.tail_of_queue.load(Acquire) {
+                let head_of_queue = unsafe { *self.head_of_queue.get() };
+                if head_of_queue == self.tail_of_queue.load(Acquire) as _ {
                     // There is only one buffer.
                     return None;
                 }
 
-                let next = unsafe { &*self.head_of_queue.get() }.next.load(Acquire);
+                let next = unsafe { &*head_of_queue }.next.load(Acquire);
                 if next.is_null() {
                     return None;
                 }
 
                 // Drop head buffer.
-                MpscQueue::drop_buffer(self.head_of_queue.get());
+                MpscQueue::drop_buffer(head_of_queue);
 
-                self.head_of_queue.set(next);
+                // Update head of queue to point to next buffer in list
+                unsafe { self.head_of_queue.get().write(next); }
             }
         }
     }
@@ -333,7 +344,7 @@ impl<T> MpscQueue<T> {
             // There are unhandled elements in the current buffer.
             if temp_head < self.buffer_size {
                 // Move forward inside the current buffer.
-                let mut temp_node = &mut unsafe { &mut *self.head_of_queue.get() }.nodes[temp_head];
+                let mut temp_node = &head_of_queue.nodes[temp_head];
                 temp_head += 1;
 
                 // We found a set node which becomes the new candidate for dequeue.
@@ -405,9 +416,9 @@ impl<T> MpscQueue<T> {
         node: &Node<T>,
         temp_head_of_queue: &mut *mut BufferList<T>,
         temp_head: &mut usize,
-        temp_node: &mut &mut Node<T>,
+        temp_node: &mut Node<T>,
     ) {
-        let mut scan_head_of_queue = self.head_of_queue.get();
+        let mut scan_head_of_queue = unsafe { *self.head_of_queue.get() };
         let mut scan_head = unsafe { &*scan_head_of_queue }.head;
 
         while node.state() == Empty && scan_head_of_queue != *temp_head_of_queue
@@ -432,7 +443,7 @@ impl<T> MpscQueue<T> {
                 *temp_node = scan_node;
 
                 // re-scan from the beginning of the queue
-                scan_head_of_queue = self.head_of_queue.get();
+                scan_head_of_queue = head_of_queue as *mut BufferList<T>;
                 scan_head = unsafe { &*scan_head_of_queue }.head;
             }
         }
@@ -576,8 +587,8 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::thread;
 
     use super::*;
@@ -587,26 +598,26 @@ mod tests {
         let q = MpscQueue::new();
 
         unsafe {
-            assert_eq!(State::Empty, (*q.head_of_queue.get()).nodes[0].state());
+            assert_eq!(State::Empty, unsafe { &**q.head_of_queue.get() }.nodes[0].state());
         }
         unsafe {
-            assert_eq!(State::Empty, (*q.head_of_queue.get()).nodes[1].state());
+            assert_eq!(State::Empty, unsafe { &**q.head_of_queue.get() }.nodes[1].state());
         }
 
         assert_eq!(Ok(()), q.enqueue(42));
         assert_eq!(Ok(()), q.enqueue(43));
 
         unsafe {
-            assert_eq!(42, (*q.head_of_queue.get()).nodes[0].data.assume_init());
+            assert_eq!(42, unsafe { &**q.head_of_queue.get() }.nodes[0].data.assume_init());
         }
         unsafe {
-            assert_eq!(State::Set, (*q.head_of_queue.get()).nodes[0].state());
+            assert_eq!(State::Set, unsafe { &**q.head_of_queue.get() }.nodes[0].state());
         }
         unsafe {
-            assert_eq!(43, (*q.head_of_queue.get()).nodes[1].data.assume_init());
+            assert_eq!(43, unsafe { &**q.head_of_queue.get() }.nodes[1].data.assume_init());
         }
         unsafe {
-            assert_eq!(State::Set, (*q.head_of_queue.get()).nodes[1].state());
+            assert_eq!(State::Set, unsafe { &**q.head_of_queue.get() }.nodes[1].state());
         }
     }
 
@@ -624,7 +635,7 @@ mod tests {
 
             if buffer == 0 {
                 unsafe {
-                    assert_eq!(i, (*q.head_of_queue.get()).nodes[index].data.assume_init());
+                    assert_eq!(i, unsafe { &**q.head_of_queue.get() }.nodes[index].data.assume_init());
                 }
             } else {
                 unsafe {
